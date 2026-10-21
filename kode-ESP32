@@ -1,0 +1,422 @@
+/*
+ * ESP32 DEVKIT V1 - Gateway MQTT Chiller Susu
+ *
+ * Fungsi:
+ *  - Terima data dari Arduino Nano (UART2)
+ *  - Publish ke MQTT broker (TLS)
+ *  - Status online/offline dengan LWT
+ *  - Terima perintah dari MQTT client lalu teruskan ke Nano
+ *
+ * Wiring ke Nano:
+ *  ESP32 GPIO16 (RX2) <- [divider 1k/2k] <- Nano D11 (TX)
+ *  ESP32 GPIO17 (TX2) -> Nano D10 (RX)
+ *  GND ESP32 <-> GND Nano
+ *
+ * Library:
+ *  PubSubClient
+ */
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+
+// ====================== KONFIGURASI ======================
+
+// --- WiFi ---
+const char* WIFI_SSID = "Svwty";
+const char* WIFI_PASS = "kudahitam";
+
+// --- MQTT HiveMQ ---
+const char* MQTT_HOST = "bca9187740f349fcb3a7d9fa1b6c2b73.s1.eu.hivemq.cloud";
+const uint16_t MQTT_PORT = 8883;
+
+const char* MQTT_USER = "Svwtyy";
+const char* MQTT_PASS = "aldi123@";
+const char* CLIENT_ID = "ESP32-001";
+
+// --- Topic sesuai Praktikum 3 ---
+
+// Publish data sensor
+const char* T_SENSOR = "iot/TRSE2026/ESP32-001/sensor";
+
+// Publish status kipas
+const char* T_FAN = "chiller/susu/fan";
+
+// Publish status ESP32
+const char* T_STATUS = "chiller/susu/status";
+
+// Subscribe perintah
+const char* T_COMMAND = "chiller/susu/command";
+
+// --- QoS ---
+const uint8_t QOS_SENSOR = 0;
+const uint8_t QOS_LWT = 2;
+const uint8_t QOS_COMMAND = 1;
+
+// --- Pin UART2 ke Nano ---
+#define RX2_PIN 16
+#define TX2_PIN 17
+
+const unsigned long PUBLISH_INTERVAL = 5000;
+
+// =========================================================
+
+WiFiClientSecure espClient;
+PubSubClient mqtt(espClient);
+
+float tDS = NAN;
+float hum = NAN;
+float pres = NAN;
+
+float fanV = NAN;
+float fanI = NAN;
+
+bool fanOn = false;
+bool autoMode = true;
+
+bool lastFanOn = false;
+bool lastAuto = true;
+bool firstData = true;
+
+unsigned long lastPublish = 0;
+unsigned long lastMqttTry = 0;
+
+String rxLine;
+
+// ====================== PUBLISH FAN ======================
+
+void publishFan() {
+
+  if (!mqtt.connected()) return;
+
+  char buf[64];
+
+  snprintf(
+    buf,
+    sizeof(buf),
+    "{\"fan\":\"%s\",\"mode\":\"%s\"}",
+    fanOn ? "ON" : "OFF",
+    autoMode ? "AUTO" : "MANUAL"
+  );
+
+  mqtt.publish(T_FAN, buf, true);
+}
+
+// ====================== MQTT CALLBACK ======================
+
+void onMessage(char* topic, byte* payload, unsigned int len) {
+
+  String msg;
+
+  for (unsigned int i = 0; i < len; i++) {
+    msg += (char)payload[i];
+  }
+
+  msg.trim();
+  msg.toUpperCase();
+
+  Serial.println("=== CALLBACK MQTT TERPANGGIL ===");
+  Serial.printf(
+    "CMD [%s]: %s\n",
+    topic,
+    msg.c_str()
+  );
+
+  if (
+    msg == "AUTO" ||
+    msg == "FAN_ON" ||
+    msg == "FAN_OFF"
+  ) {
+
+    Serial2.print("CMD,");
+    Serial2.println(msg);
+
+    Serial.println(">>> Dikirim ke Nano: CMD," + msg);
+
+  } else {
+
+    Serial.println(">>> Perintah TIDAK DIKENAL: [" + msg + "]");
+  }
+}
+
+// ====================== PARSE DATA NANO ======================
+
+void parseLine(const String& line) {
+
+  /*
+   * Format dari Nano:
+   *
+   * DATA,dsTemp,humidity,pressure,fan,auto,volt,arus
+   *
+   * Contoh:
+   * DATA,4.25,65.30,958.70,1,1,5.02,120.5
+   */
+
+  if (!line.startsWith("DATA,")) return;
+
+  float a, c, d, v, i;
+  int f, m;
+
+  int hasil = sscanf(
+    line.c_str(),
+    "DATA,%f,%f,%f,%d,%d,%f,%f",
+    &a,
+    &c,
+    &d,
+    &f,
+    &m,
+    &v,
+    &i
+  );
+
+  if (hasil == 7) {
+
+    tDS = a;
+    hum = c;
+    pres = d;
+
+    fanOn = (f == 1);
+    autoMode = (m == 1);
+
+    fanV = v;
+    fanI = i;
+
+    Serial.println("DATA NANO BERHASIL DIPARSING");
+    Serial.print("Suhu DS18B20 : ");
+    Serial.println(tDS);
+
+    Serial.print("Kelembapan   : ");
+    Serial.println(hum);
+
+    Serial.print("Tekanan      : ");
+    Serial.println(pres);
+
+    Serial.print("Tegangan Fan : ");
+    Serial.println(fanV);
+
+    Serial.print("Arus Fan     : ");
+    Serial.println(fanI);
+
+    Serial.print("Fan          : ");
+    Serial.println(fanOn ? "ON" : "OFF");
+
+    Serial.print("Mode         : ");
+    Serial.println(autoMode ? "AUTO" : "MANUAL");
+
+    if (
+      firstData ||
+      fanOn != lastFanOn ||
+      autoMode != lastAuto
+    ) {
+
+      publishFan();
+
+      lastFanOn = fanOn;
+      lastAuto = autoMode;
+      firstData = false;
+    }
+
+  } else {
+
+    Serial.print("GAGAL PARSING DATA NANO. Jumlah data: ");
+    Serial.println(hasil);
+
+    Serial.print("Data yang diterima: ");
+    Serial.println(line);
+  }
+}
+
+// ====================== BACA DATA NANO ======================
+
+void readNano() {
+
+  while (Serial2.available()) {
+
+    char ch = Serial2.read();
+
+    if (ch == '\n') {
+
+      // DEBUG: tampilkan data mentah dari Nano
+      Serial.print("DATA DARI NANO: ");
+      Serial.println(rxLine);
+
+      parseLine(rxLine);
+
+      rxLine = "";
+
+    } else if (
+      ch != '\r' &&
+      rxLine.length() < 100
+    ) {
+
+      rxLine += ch;
+    }
+  }
+}
+
+// ====================== WIFI ======================
+
+void connectWiFi() {
+
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  WiFi.mode(WIFI_STA);
+
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASS
+  );
+
+  unsigned long t = millis();
+
+  while (
+    WiFi.status() != WL_CONNECTED &&
+    millis() - t < 10000
+  ) {
+
+    delay(250);
+  }
+}
+
+// ====================== MQTT ======================
+
+void connectMqtt() {
+
+  if (
+    mqtt.connected() ||
+    WiFi.status() != WL_CONNECTED
+  ) {
+    return;
+  }
+
+  if (millis() - lastMqttTry < 5000) return;
+
+  lastMqttTry = millis();
+
+  if (
+    mqtt.connect(
+      CLIENT_ID,
+      MQTT_USER,
+      MQTT_PASS,
+      T_STATUS,
+      QOS_LWT,
+      true,
+      "offline"
+    )
+  ) {
+
+    Serial.println("MQTT terhubung");
+
+    mqtt.publish(
+      T_STATUS,
+      "online",
+      true
+    );
+
+    mqtt.subscribe(
+      T_COMMAND,
+      QOS_COMMAND
+    );
+
+    publishFan();
+
+  } else {
+
+    Serial.printf(
+      "MQTT gagal, rc=%d\n",
+      mqtt.state()
+    );
+  }
+}
+
+// ====================== PUBLISH SENSOR ======================
+
+void publishSensor() {
+
+  if (!mqtt.connected()) return;
+
+  char buf[250];
+
+  snprintf(
+    buf,
+    sizeof(buf),
+
+    "{\"device_id\":\"ESP32-001\","
+    "\"temp_ds18b20\":%.2f,"
+    "\"humidity\":%.2f,"
+    "\"pressure\":%.2f,"
+    "\"fan\":\"%s\","
+    "\"mode\":\"%s\","
+    "\"fan_voltage\":%.2f,"
+    "\"fan_current_mA\":%.1f}",
+
+    isnan(tDS) ? -999.0 : tDS,
+    isnan(hum) ? -999.0 : hum,
+    isnan(pres) ? -999.0 : pres,
+
+    fanOn ? "ON" : "OFF",
+    autoMode ? "AUTO" : "MANUAL",
+
+    isnan(fanV) ? -999.0 : fanV,
+    isnan(fanI) ? -999.0 : fanI
+  );
+
+  mqtt.publish(
+    T_SENSOR,
+    buf
+  );
+
+  Serial.print("Publish: ");
+  Serial.println(buf);
+}
+
+// ====================== SETUP ======================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  Serial2.begin(
+    9600,
+    SERIAL_8N1,
+    RX2_PIN,
+    TX2_PIN
+  );
+
+  connectWiFi();
+
+  // Untuk praktikum / pengujian
+  espClient.setInsecure();
+
+  mqtt.setServer(
+    MQTT_HOST,
+    MQTT_PORT
+  );
+
+  mqtt.setCallback(onMessage);
+
+  mqtt.setKeepAlive(30);
+}
+
+// ====================== LOOP ======================
+
+void loop() {
+
+  connectWiFi();
+
+  connectMqtt();
+
+  mqtt.loop();
+
+  readNano();
+
+  if (
+    millis() - lastPublish >=
+    PUBLISH_INTERVAL
+  ) {
+
+    lastPublish = millis();
+
+    publishSensor();
+  }
+}
